@@ -1,0 +1,52 @@
+Pull Teams + channels
+Post messages into channels
+Send emails
+Schedule meetings
+
+
+LOGIN - Start Device Flow
+Invoke-RestMethod "http://localhost:8080/auth/device-begin" -Method POST
+
+Complete Login Device Flow
+Invoke-RestMethod "http://localhost:8080/auth/device-complete" -Method POST
+
+
+
+#Who AM I?
+Invoke-RestMethod "http://localhost:8080/me-delegated"
+
+#List Current Teams Groups
+Invoke-RestMethod "http://localhost:8080/my/joined-teams"
+
+#List Specific Channels
+Invoke-RestMethod "http://localhost:8080/teams/<TEAM_ID>/channels"
+
+#Senda a Channel Message
+Invoke-RestMethod "http://localhost:8080/send-channel-message-delegated" `
+  -Method POST -ContentType "application/json" `
+  -Body (@{
+      team_id    = "<TEAM_ID>"
+      channel_id = "<CHANNEL_ID>"
+      message    = "Hello from my FastAPI bridge!"
+  } | ConvertTo-Json)
+
+#Send Email
+Invoke-RestMethod "http://localhost:8080/send-email-delegated" `
+  -Method POST -ContentType "application/json" `
+  -Body (@{
+      to        = @("someone@yourtenant.onmicrosoft.com")
+      subject   = "Graph API Test"
+      body_html = "<b>Hello!</b><br/>This is a test email via Graph + FastAPI."
+  } | ConvertTo-Json)
+
+#Schedule a Teams Meeting
+Invoke-RestMethod "http://localhost:8080/schedule-meeting-delegated" `
+  -Method POST -ContentType "application/json" `
+  -Body (@{
+      subject    = "Daily Project Sync"
+      start_iso  = "2025-09-02T20:00:00"
+      end_iso    = "2025-09-02T20:30:00"
+      attendees  = @("someone@yourtenant.onmicrosoft.com")
+      body_html  = "Created by FastAPI bridge."
+      location   = "Virtual"
+  } | ConvertTo-Json)

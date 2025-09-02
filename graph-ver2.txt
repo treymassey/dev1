@@ -1,0 +1,241 @@
+# app/main.py
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional, List
+import os
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+TENANT_ID = os.getenv("TENANT_ID")
+CLIENT_ID = os.getenv("CLIENT_ID")
+DEFAULT_TEAM_ID = os.getenv("TEAM_ID")
+DEFAULT_CHANNEL_ID = os.getenv("CHANNEL_ID")
+DEFAULT_SENDER_UPN = os.getenv("SENDER_UPN")  # optional
+
+if not (TENANT_ID and CLIENT_ID):
+    raise RuntimeError("TENANT_ID and CLIENT_ID must be set via .env or environment")
+
+app = FastAPI(title="Teams/Graph API Bridge", version="0.4.0")
+
+# ── Delegated (Device Code) auth via MSAL ─────────────────────────────────────
+from msal import PublicClientApplication, SerializableTokenCache
+
+# Use plain Graph scopes (no resource prefix, no OIDC scopes here)
+DELEGATED_SCOPES = [
+    "User.Read",
+    "ChannelMessage.Send",
+    "Chat.ReadWrite",
+    "Mail.Send",
+    "Calendars.ReadWrite",
+    "Group.Read.All",
+    "Group.ReadWrite.All",
+]
+
+CACHE_PATH = "token-cache.json"
+token_cache = SerializableTokenCache()
+try:
+    with open(CACHE_PATH, "r") as f:
+        token_cache.deserialize(f.read())
+except FileNotFoundError:
+    pass
+
+def save_cache():
+    if token_cache.has_state_changed:
+        with open(CACHE_PATH, "w") as f:
+            f.write(token_cache.serialize())
+
+public_app = PublicClientApplication(
+    CLIENT_ID,
+    authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+    token_cache=token_cache,
+)
+
+def get_user_token() -> str:
+    accounts = public_app.get_accounts()
+    if accounts:
+        result = public_app.acquire_token_silent(DELEGATED_SCOPES, account=accounts[0])
+        if result and "access_token" in result:
+            return result["access_token"]
+    raise HTTPException(status_code=401, detail="No delegated token—run /auth/device-begin + /auth/device-complete")
+
+# Simple in-memory holder for current device flow
+DEVICE_FLOW: Optional[dict] = None
+
+
+# ── Models ────────────────────────────────────────────────────────────────────
+class ChannelMessageReq(BaseModel):
+    team_id: Optional[str] = None
+    channel_id: Optional[str] = None
+    message: str
+
+class EmailReq(BaseModel):
+    to: List[str]
+    subject: str
+    body_html: str
+
+class MeetingReq(BaseModel):
+    organizer_upn: Optional[str] = None
+    subject: str
+    start_iso: str
+    end_iso: str
+    attendees: List[str] = []
+    body_html: Optional[str] = None
+    location: Optional[str] = None
+
+
+# ── Small HTTP helpers ────────────────────────────────────────────────────────
+async def graph_get(url: str, token: str):
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+
+async def graph_post(url: str, token: str, json: dict):
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers={"Authorization": f"Bearer {token}"}, json=json)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json() if r.text else {"ok": True}
+
+
+# ── Health ────────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+# ── Device Code Auth (two-step, non-blocking) ─────────────────────────────────
+@app.post("/auth/device-begin")
+def device_begin():
+    """
+    Start the device code flow and return the URL + code (does NOT block).
+    Use /auth/device-complete to finish.
+    """
+    global DEVICE_FLOW
+    DEVICE_FLOW = public_app.initiate_device_flow(scopes=DELEGATED_SCOPES)
+    if "user_code" not in DEVICE_FLOW:
+        raise HTTPException(status_code=500, detail="Failed to create device code flow")
+
+    # Also print to server logs so you see it in the Uvicorn window
+    print(DEVICE_FLOW.get("message"))
+
+    return {
+        "verification_uri": DEVICE_FLOW.get("verification_uri")
+            or DEVICE_FLOW.get("verification_uri_complete"),
+        "user_code": DEVICE_FLOW["user_code"],
+        "message": DEVICE_FLOW.get("message"),
+        "expires_in": DEVICE_FLOW.get("expires_in"),
+        "interval": DEVICE_FLOW.get("interval"),
+    }
+
+@app.post("/auth/device-complete")
+def device_complete():
+    """
+    Finish the device code flow (blocks briefly while MSAL polls).
+    """
+    global DEVICE_FLOW
+    if not DEVICE_FLOW:
+        raise HTTPException(status_code=400, detail="No active device flow—call /auth/device-begin first")
+
+    result = public_app.acquire_token_by_device_flow(DEVICE_FLOW)
+    save_cache()
+    DEVICE_FLOW = None
+
+    if "access_token" not in result:
+        raise HTTPException(status_code=401, detail=result.get("error_description", "Device code auth failed"))
+
+    acct = public_app.get_accounts()[0].get("username")
+    return {"ok": True, "account": acct}
+
+# Optional: one-shot blocking endpoint (kept for completeness)
+@app.post("/auth/device-login")
+def device_login():
+    flow = public_app.initiate_device_flow(scopes=DELEGATED_SCOPES)
+    if "user_code" not in flow:
+        raise HTTPException(status_code=500, detail="Failed to create device code flow")
+    print(flow.get("message"))
+    result = public_app.acquire_token_by_device_flow(flow)  # blocks until completed or expired
+    save_cache()
+    if "access_token" not in result:
+        raise HTTPException(status_code=401, detail=result.get("error_description", "Device code auth failed"))
+    acct = public_app.get_accounts()[0].get("username")
+    return {"ok": True, "account": acct}
+
+
+# ── Graph convenience endpoints ───────────────────────────────────────────────
+@app.get("/me-delegated")
+async def me_delegated():
+    token = get_user_token()
+    return await graph_get(f"{GRAPH_BASE}/me", token)
+
+@app.get("/my/joined-teams")
+async def my_joined_teams():
+    token = get_user_token()
+    return await graph_get(f"{GRAPH_BASE}/me/joinedTeams", token)
+
+@app.get("/teams/{team_id}/channels")
+async def team_channels(team_id: str):
+    token = get_user_token()
+    return await graph_get(f"{GRAPH_BASE}/teams/{team_id}/channels", token)
+
+
+# ── Actions: send to Teams, send email, schedule meeting ──────────────────────
+@app.post("/send-channel-message-delegated")
+async def send_channel_message_delegated(req: ChannelMessageReq):
+    team_id = req.team_id or DEFAULT_TEAM_ID
+    channel_id = req.channel_id or DEFAULT_CHANNEL_ID
+    if not team_id or not channel_id:
+        raise HTTPException(status_code=400, detail="team_id and channel_id are required")
+
+    token = get_user_token()
+    url = f"{GRAPH_BASE}/teams/{team_id}/channels/{channel_id}/messages"
+    payload = {"body": {"content": req.message}}
+    return await graph_post(url, token, payload)
+
+@app.post("/send-email-delegated")
+async def send_email_delegated(req: EmailReq):
+    token = get_user_token()
+    me = await graph_get(f"{GRAPH_BASE}/me", token)
+    sender = me.get("userPrincipalName") or me.get("mail")
+    if not sender:
+        raise HTTPException(status_code=400, detail="Could not resolve signed-in user's UPN")
+
+    url = f"{GRAPH_BASE}/users/{sender}/sendMail"
+    body = {
+        "message": {
+            "subject": req.subject,
+            "body": {"contentType": "HTML", "content": req.body_html},
+            "toRecipients": [{"emailAddress": {"address": a}} for a in req.to],
+        },
+        "saveToSentItems": True,
+    }
+    return await graph_post(url, token, body)
+
+@app.post("/schedule-meeting-delegated")
+async def schedule_meeting_delegated(req: MeetingReq):
+    token = get_user_token()
+    me = await graph_get(f"{GRAPH_BASE}/me", token)
+    organizer_upn = req.organizer_upn or me.get("userPrincipalName")
+    if not organizer_upn:
+        raise HTTPException(status_code=400, detail="Could not resolve organizer UPN")
+
+    url = f"{GRAPH_BASE}/users/{organizer_upn}/events"
+    attendees = [{"emailAddress": {"address": a}, "type": "required"} for a in req.attendees]
+    body = {
+        "subject": req.subject,
+        "start": {"dateTime": req.start_iso, "timeZone": "UTC"},
+        "end":   {"dateTime": req.end_iso,   "timeZone": "UTC"},
+        "location": {"displayName": req.location} if req.location else None,
+        "body": {"contentType": "HTML", "content": req.body_html or ""},
+        "attendees": attendees,
+        "isOnlineMeeting": True,
+        "onlineMeetingProvider": "teamsForBusiness",
+    }
+    body = {k: v for k, v in body.items() if v is not None}
+    return await graph_post(url, token, body)

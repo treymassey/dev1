@@ -1,0 +1,20 @@
+#json container
+
+{
+  "name": "teams-graph-codespace",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": { "version": "3.11" }
+  },
+  "forwardPorts": [8080],
+  "portsAttributes": { "8080": { "label": "FastAPI" } },
+  "postCreateCommand": "pip install -r requirements.txt",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+      ]
+    }
+  },
+  "remoteUser": "vscode"
+}

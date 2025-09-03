@@ -50,3 +50,21 @@ Invoke-RestMethod "http://localhost:8080/schedule-meeting-delegated" `
       body_html  = "Created by FastAPI bridge."
       location   = "Virtual"
   } | ConvertTo-Json)
+
+
+# Meeting Scheduler - Powershell-Specific
+curl.exe -i -X POST "http://localhost:8080/schedule-meeting-delegated" ^
+  -H "Content-Type: application/json" ^
+  -d "{ \"subject\":\"Daily Sync\", \"start_iso\":\"2025-09-07T12:00:00\", \"end_iso\":\"2025-09-07T12:30:00\", \"attendees\":[\"ramassey@deloitte.com\"] }"
+
+
+# Send to multi recipients
+curl.exe -X POST "http://localhost:8080/send-email-delegated" ^
+  -H "Content-Type: application/json" ^
+  -d "{ 
+        \"to\":[\"user1@contoso.com\",\"user2@contoso.com\"],
+        \"cc\":[\"manager@contoso.com\"],
+        \"bcc\":[\"auditor@contoso.com\"],
+        \"subject\":\"Graph Email Test\",
+        \"body_html\":\"<b>Hello team</b>\"
+      }"

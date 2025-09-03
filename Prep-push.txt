@@ -1,0 +1,88 @@
+Prep
+
+# make sure these files exist (adjust if needed)
+type requirements.txt
+type app\main.py
+if (!(Test-Path .gitignore)) {
+  @"
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+token-cache.json
+
+# VS Code / Dev
+.vscode/
+"@ | Set-Content .gitignore
+}
+
+# init git if not already
+git init
+git checkout -b massey-dev
+
+# stage & commit
+git add .
+git commit -m "Initial FastAPI + MSAL Graph bridge (delegated auth)"
+
+
+verify codespaces (JSON)
+{
+  "name": "teams-graph-codespace",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": { "version": "3.11" }
+  },
+  "forwardPorts": [8080],
+  "portsAttributes": { "8080": { "label": "FastAPI" } },
+  "containerEnv": {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "postCreateCommand": "pip install -r requirements.txt",
+  "remoteUser": "vscode"
+}
+
+
+
+# powershell if changes made
+git add .devcontainer/devcontainer.json
+git commit -m "Devcontainer: auto-install deps, expose 8080"
+git push
+
+
+# Build a Docker Image on Push
+
+mkdir .github\workflows -Force | Out-Null
+@'
+name: docker-build
+on:
+  push:
+    branches: [ massey-dev, main ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: teams-graph-bridge:ci
+'@ | Set-Content .github/workflows/docker.yml
+
+git add .github/workflows/docker.yml
+git commit -m "CI: Docker build on push"
+git push
+
+
+# ReadMe Info
+#Open the repo → Code → Codespaces → Create (choose branch massey-dev).
+#Container builds, deps install.
+
+#Terminal:
+uvicorn app.main:app --host 0.0.0.0 --port 8080
+
+
+#New terminal:
+curl -X POST http://localhost:8080/auth/device-login

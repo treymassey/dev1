@@ -68,3 +68,19 @@ curl.exe -X POST "http://localhost:8080/send-email-delegated" ^
         \"subject\":\"Graph Email Test\",
         \"body_html\":\"<b>Hello team</b>\"
       }"
+
+
+# JSON File
+@'
+{
+  "subject": "Daily Sync",
+  "start_iso": "2025-09-07T12:00:00",
+  "end_iso": "2025-09-07T12:30:00",
+  "attendees": ["ramassey@deloitte.com"]
+}
+'@ | Out-File -FilePath meeting.json -Encoding utf8
+
+#curl file
+curl.exe -X POST "http://localhost:8080/schedule-meeting-delegated" ^
+  -H "Content-Type: application/json" ^
+  --data-binary "@meeting.json"

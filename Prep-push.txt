@@ -86,3 +86,19 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 
 #New terminal:
 curl -X POST http://localhost:8080/auth/device-login
+
+
+
+# force prompt
+
+@"
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+token-cache.json
+
+# VS Code / Dev
+.vscode/
+"@ | Out-File .gitignore -Encoding utf8

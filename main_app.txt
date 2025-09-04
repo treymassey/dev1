@@ -1,0 +1,513 @@
+## File: `app/main_app.py`
+
+```python
+import json
+import os
+import time
+from typing import List, Optional, Dict, Any
+
+import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, EmailStr, Field
+import msal
+
+GRAPH_BASE = os.getenv("GRAPH_BASE", "https://graph.microsoft.com/v1.0")
+TENANT_ID = os.getenv("TENANT_ID")
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPE = ["https://graph.microsoft.com/.default"]
+TOKEN_CACHE_FILE = os.getenv("TOKEN_CACHE_FILE", "/tmp/msal_token_cache.bin")
+
+# -----------------------------------------------------------------------------
+# MSAL helper
+# -----------------------------------------------------------------------------
+
+def _read_cache():
+    cache = msal.SerializableTokenCache()
+    if os.path.exists(TOKEN_CACHE_FILE):
+        try:
+            cache.deserialize(open(TOKEN_CACHE_FILE, "r").read())
+        except Exception:
+            pass
+    return cache
+
+
+def _write_cache(cache: msal.SerializableTokenCache):
+    if cache.has_state_changed:
+        with open(TOKEN_CACHE_FILE, "w") as f:
+            f.write(cache.serialize())
+
+
+def get_app_token() -> str:
+    """Acquire an app-only access token via client credentials."""
+    cache = _read_cache()
+    app = msal.ConfidentialClientApplication(
+        client_id=CLIENT_ID,
+        client_credential=CLIENT_SECRET,
+        authority=AUTHORITY,
+        token_cache=cache,
+    )
+    result = app.acquire_token_silent(SCOPE, account=None)
+    if not result:
+        result = app.acquire_token_for_client(scopes=SCOPE)
+    _write_cache(cache)
+    if "access_token" not in result:
+        raise RuntimeError(f"Failed to obtain token: {result}")
+    return result["access_token"]
+
+
+def graph_request(method: str, path: str, *, params: Dict[str, Any] | None = None,
+                  json_body: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    token = get_app_token()
+    url = f"{GRAPH_BASE}{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.request(method, url, headers=headers, params=params, json=json_body)
+    if not resp.ok:
+        detail = {
+            "status": resp.status_code,
+            "url": url,
+            "response": safe_json(resp)
+        }
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    return safe_json(resp)
+
+
+def safe_json(resp: requests.Response) -> Dict[str, Any]:
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw": resp.text}
+
+
+# -----------------------------------------------------------------------------
+# Pydantic models
+# -----------------------------------------------------------------------------
+
+class EmailAddress(BaseModel):
+    address: EmailStr
+    name: Optional[str] = None
+
+
+class Recipient(BaseModel):
+    emailAddress: EmailAddress
+
+
+class SendMailRequest(BaseModel):
+    from_user_id: str = Field(
+        ...,
+        description="Object ID or UPN of the mailbox to send FROM (app must be allowed to send as this user)",
+    )
+    to: List[EmailAddress]
+    subject: str
+    html_body: str
+    cc: Optional[List[EmailAddress]] = None
+    bcc: Optional[List[EmailAddress]] = None
+    save_to_sent_items: bool = True
+
+
+class Attendee(BaseModel):
+    email: EmailStr
+    name: Optional[str] = None
+    type: str = Field(default="required", description="required|optional|resource")
+
+
+class CreateEventRequest(BaseModel):
+    user_id: str
+    subject: str
+    body_html: str = ""
+    start_iso: str
+    end_iso: str
+    timezone: str = "UTC"
+    attendees: List[Attendee] = []
+    is_online_meeting: bool = True
+
+
+class CreateOnlineMeetingRequest(BaseModel):
+    user_id: str
+    subject: str
+    start_iso: str
+    end_iso: str
+    lobby_bypass: Optional[str] = None  # e.g., "organizer", "everyone"
+
+
+class CreateChannelRequest(BaseModel):
+    team_id: str
+    display_name: str
+    description: Optional[str] = None
+    membership_type: str = Field(default="standard", description="standard|private|shared")
+
+
+class PostChannelMessageRequest(BaseModel):
+    team_id: str
+    channel_id: str
+    content: str
+    content_type: str = Field(default="html", description="text|html")
+
+
+class FollowUpFromAttendanceRequest(BaseModel):
+    organizer_user_id: str
+    online_meeting_id: str
+    start_iso: str
+    end_iso: str
+    subject: str
+    body_html: str = ""
+
+
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
+
+app = FastAPI(title="Graph App-Only Service", version="1.0.0")
+
+
+# --------------------------- Mail --------------------------------------------
+@app.post("/mail/send")
+def send_mail(req: SendMailRequest):
+    message = {
+        "subject": req.subject,
+        "body": {"contentType": "HTML", "content": req.html_body},
+        "toRecipients": [{"emailAddress": a.dict()} for a in req.to],
+    }
+    if req.cc:
+        message["ccRecipients"] = [{"emailAddress": a.dict()} for a in req.cc]
+    if req.bcc:
+        message["bccRecipients"] = [{"emailAddress": a.dict()} for a in req.bcc]
+
+    payload = {"message": message, "saveToSentItems": req.save_to_sent_items}
+
+    # App perm Mail.Send lets us call /users/{id}/sendMail to send AS that user
+    path = f"/users/{req.from_user_id}/sendMail"
+    result = graph_request("POST", path, json_body=payload)
+    return {"ok": True, "graph": result}
+
+
+# --------------------------- Calendar / Events --------------------------------
+@app.post("/events")
+def create_event(req: CreateEventRequest):
+    attendees = [
+        {
+            "emailAddress": {"address": a.email, "name": a.name or a.email},
+            "type": a.type.capitalize(),
+        }
+        for a in req.attendees
+    ]
+
+    event = {
+        "subject": req.subject,
+        "body": {"contentType": "HTML", "content": req.body_html},
+        "start": {"dateTime": req.start_iso, "timeZone": req.timezone},
+        "end": {"dateTime": req.end_iso, "timeZone": req.timezone},
+        "attendees": attendees,
+        "isOnlineMeeting": req.is_online_meeting,
+        "onlineMeetingProvider": "teamsForBusiness" if req.is_online_meeting else None,
+    }
+    # Remove None properties
+    event = {k: v for k, v in event.items() if v is not None}
+
+    path = f"/users/{req.user_id}/events"
+    created = graph_request("POST", path, json_body=event)
+
+    # Tip: To get joinUrl, re-fetch with $expand=onlineMeeting
+    event_id = created.get("id")
+    if event_id:
+        expanded = graph_request(
+            "GET",
+            f"/users/{req.user_id}/events/{event_id}",
+            params={"$expand": "onlineMeeting"},
+        )
+        created = expanded
+
+    return {"ok": True, "event": created}
+
+
+# --------------------------- Online Meetings ----------------------------------
+@app.post("/online-meetings")
+def create_online_meeting(req: CreateOnlineMeetingRequest):
+    # Requires OnlineMeetings.ReadWrite.All and a Cloud Comms Application Access Policy for the organizer
+    body = {
+        "startDateTime": req.start_iso,
+        "endDateTime": req.end_iso,
+        "subject": req.subject,
+    }
+    if req.lobby_bypass:
+        body["lobbyBypassSettings"] = {"scope": req.lobby_bypass}
+
+    created = graph_request("POST", f"/users/{req.user_id}/onlineMeetings", json_body=body)
+    return {"ok": True, "onlineMeeting": created}
+
+
+# --------------------------- Teams Channels -----------------------------------
+@app.post("/teams/channels")
+def create_channel(req: CreateChannelRequest):
+    body = {
+        "displayName": req.display_name,
+        "description": req.description,
+        "membershipType": req.membership_type,
+    }
+    result = graph_request("POST", f"/teams/{req.team_id}/channels", json_body=body)
+    return {"ok": True, "channel": result}
+
+
+@app.post("/teams/channels/message")
+def post_channel_message(req: PostChannelMessageRequest):
+    # Requires RSC app permission ChannelMessage.Send.Group (install app in the team)
+    body = {
+        "body": {
+            "contentType": req.content_type,
+            "content": req.content,
+        }
+    }
+    result = graph_request(
+        "POST",
+        f"/teams/{req.team_id}/channels/{req.channel_id}/messages",
+        json_body=body,
+    )
+    return {"ok": True, "message": result}
+
+
+# --------------------------- Teams Chats (read-only with app perms) -----------
+@app.get("/chats/{chat_id}/messages")
+def get_chat_messages(chat_id: str, top: int = 50):
+    # Requires Chat.Read.All (or Chat.ReadWrite.All). Sending messages in chats requires a bot.
+    result = graph_request("GET", f"/chats/{chat_id}/messages", params={"$top": top})
+    return {"ok": True, "messages": result}
+
+
+# --------------------------- Attendance & Follow-up ---------------------------
+@app.get("/online-meetings/{organizer_user_id}/{online_meeting_id}/attendance")
+def get_attendance(organizer_user_id: str, online_meeting_id: str):
+    # Requires OnlineMeetingArtifact.Read.All and Cloud Comms AAP for organizer
+    reports = graph_request(
+        "GET",
+        f"/users/{organizer_user_id}/onlineMeetings/{online_meeting_id}/attendanceReports",
+        params={"$expand": "attendanceRecords"},
+    )
+    return {"ok": True, "attendanceReports": reports}
+
+
+@app.post("/online-meetings/followup")
+def schedule_followup_from_attendance(req: FollowUpFromAttendanceRequest):
+    # Pull attendance, extract emails (where available), and schedule a new Teams event
+    reports = graph_request(
+        "GET",
+        f"/users/{req.organizer_user_id}/onlineMeetings/{req.online_meeting_id}/attendanceReports",
+        params={"$expand": "attendanceRecords"},
+    )
+
+    # Collect unique emails when present
+    emails: set[str] = set()
+    for report in reports.get("value", []):
+        for rec in report.get("attendanceRecords", []):
+            email = (rec.get("emailAddress") or "").strip()
+            if email:
+                emails.add(email)
+
+    attendees = [Attendee(email=e).dict() for e in sorted(emails)]
+
+    create_req = CreateEventRequest(
+        user_id=req.organizer_user_id,
+        subject=req.subject,
+        body_html=req.body_html,
+        start_iso=req.start_iso,
+        end_iso=req.end_iso,
+        attendees=[Attendee(email=e) for e in sorted(emails)],
+        is_online_meeting=True,
+    )
+    return create_event(create_req)
+
+
+# --------------------------- Health ------------------------------------------
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "ts": int(time.time())}
+```
+
+---
+
+## File: `requirements.txt`
+
+```txt
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+msal==1.31.0
+requests==2.32.3
+pydantic==2.8.2
+python-dotenv==1.0.1
+```
+
+---
+
+## File: `Dockerfile`
+
+```dockerfile
+# syntax=docker/dockerfile:1.6
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# System deps (optional: curl for health/debug)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
+
+COPY app ./app
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s CMD curl -fsS http://localhost:8080/healthz || exit 1
+
+CMD ["uvicorn", "app.main_app:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+---
+
+## File: `docker-compose.yml`
+
+```yaml
+version: "3.9"
+services:
+  graph-app-only:
+    build: .
+    image: graph-app-only:latest
+    env_file: .env
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+```
+
+---
+
+## File: `.env.example`
+
+```env
+# Azure Entra / Graph app registration
+TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+CLIENT_ID=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
+CLIENT_SECRET=your-super-secret # or use managed identity / certificates
+
+# Optional
+GRAPH_BASE=https://graph.microsoft.com/v1.0
+TOKEN_CACHE_FILE=/tmp/msal_token_cache.bin
+```
+
+---
+
+## Quickstart
+
+```bash
+# 1) Prepare env
+cp .env.example .env
+# set TENANT_ID, CLIENT_ID, CLIENT_SECRET
+
+# 2) Build and run
+docker compose up --build -d
+
+# 3) Smoke test
+curl http://localhost:8080/healthz
+```
+
+### Example: send email as a user (app must be allowed to that mailbox)
+
+```bash
+curl -X POST http://localhost:8080/mail/send \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "from_user_id": "user@contoso.com",
+    "to": [{"address": "alex@contoso.com", "name": "Alex"}],
+    "subject": "Hello from app-only",
+    "html_body": "<b>App-only Graph</b> works!"
+  }'
+```
+
+### Example: create Teams meeting (organizer user)
+
+```bash
+curl -X POST http://localhost:8080/online-meetings \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "user_id": "organizer-object-id-or-upn",
+    "subject": "Project sync",
+    "start_iso": "2025-09-04T15:00:00",
+    "end_iso": "2025-09-04T15:30:00"
+  }'
+```
+
+### Example: create event (Teams meeting) & return joinUrl
+
+```bash
+curl -X POST http://localhost:8080/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "user_id": "organizer@contoso.com",
+    "subject": "Follow-up",
+    "start_iso": "2025-09-05T16:00:00",
+    "end_iso": "2025-09-05T16:30:00",
+    "timezone": "America/Chicago",
+    "attendees": [{"email": "alex@contoso.com"}],
+    "is_online_meeting": true
+  }'
+```
+
+### Example: create channel (requires RSC Channel.Create.Group or Channel.Create)
+
+```bash
+curl -X POST http://localhost:8080/teams/channels \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "team_id": "00000000-0000-0000-0000-000000000000",
+    "display_name": "planning",
+    "description": "Sprint planning"
+  }'
+```
+
+### Example: post channel message (requires RSC ChannelMessage.Send.Group)
+
+```bash
+curl -X POST http://localhost:8080/teams/channels/message \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "team_id": "00000000-0000-0000-0000-000000000000",
+    "channel_id": "19:abcd1234@thread.tacv2",
+    "content": "<b>Reminder:</b> Retro at 4pm Central"
+  }'
+```
+
+### Example: build a follow-up meeting from attendance
+
+```bash
+curl -X POST http://localhost:8080/online-meetings/followup \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "organizer_user_id": "organizer-object-id-or-upn",
+    "online_meeting_id": "MEETING_ID",
+    "start_iso": "2025-09-06T17:00:00",
+    "end_iso": "2025-09-06T17:30:00",
+    "subject": "Follow-up: Decisions & Actions"
+  }'
+```
+
+---
+
+## Hardening checklist (ops)
+
+* Use **cert-based auth** or **Managed Identity** instead of client secret (configure msal accordingly)
+* Configure **Exchange RBAC for Applications** (or legacy Application Access Policies) to limit mailbox scope
+* Configure **Cloud Comms Application Access Policy** for organizers whose meetings you’ll touch
+* Prefer **RSC** for Teams actions (install app to teams; avoid tenant-wide `Group.ReadWrite.All`/`Directory.ReadWrite.All`)
+* Store secrets in a **vault**; mount via environment
+* Set network egress allow-list for `graph.microsoft.com` and `login.microsoftonline.com`
+* Add structured logging and retry with backoff on 429/5xx
+
+```
+```

@@ -1,24 +1,37 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
   "manifestVersion": "1.16",
-  "id": "<YOUR_AAD_APP_CLIENT_ID>",
-  "packageName": "com.contoso.nora-rsc",
-  "name": { "short": "Nora RSC", "full": "Nora Resource-Specific Consent App" },
+  "version": "1.0.0",
+  "id": "b163abc9-33a5-4dce-ad85-8216b1d6eaf1",
+  "packageName": "com.contoso.mona-rsc",
+  "name": { "short": "Mona RSC", "full": "Mona Resource-Specific Consent App" },
   "developer": {
     "name": "Your Org",
-    "websiteUrl": "https://contoso.com",
-    "privacyUrl": "https://contoso.com/privacy",
-    "termsOfUseUrl": "https://contoso.com/terms"
+    "websiteUrl": "https://asendgps-dev.com",
+    "privacyUrl": "https://asendgps-dev.com/privacy",
+    "termsOfUseUrl": "https://asendgps-dev.com/terms"
   },
   "description": {
     "short": "Grants this app permission to post in this team.",
-    "full": "Installs Nora RSC in a team to allow ChannelMessage.Send.Group and Channel.Create.Group in that team only."
+    "full": "Installs Mona RSC in a team to allow ChannelMessage.Send.Group and Channel.Create.Group in that team only."
   },
   "icons": { "outline": "outline.png", "color": "color.png" },
   "accentColor": "#6264A7",
+
+  "staticTabs": [
+    {
+      "entityId": "about",
+      "name": "About",
+      "contentUrl": "https://asendgps-dev.com/",
+      "websiteUrl": "https://asendgps-dev.com/",
+      "scopes": ["personal"]
+    }
+  ],
+  "validDomains": ["asendgps-dev.com"],
+
   "webApplicationInfo": {
-    "id": "<YOUR_AAD_APP_CLIENT_ID>",
-    "resource": "api://<YOUR_AAD_APP_CLIENT_ID>"
+    "id": "b163abc9-33a5-4dce-ad85-8216b1d6eaf1",
+    "resource": "api://b163abc9-33a5-4dce-ad85-8216b1d6eaf1"
   },
   "authorization": {
     "permissions": {

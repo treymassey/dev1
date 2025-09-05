@@ -1,0 +1,60 @@
+
+# Send Mail
+curl -X POST http://localhost:8080/mail/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_user_id": "user1@contoso.com",
+    "to": [{"address":"alex@contoso.com","name":"Alex"}],
+    "subject":"App-only hello",
+    "html_body":"<b>Graph App-only</b> test"
+  }'
+
+# Send Calendar Invite
+curl -X POST http://localhost:8080/events \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id":"organizer@contoso.com",
+    "subject":"Nora App-only Event",
+    "body_html":"Auto-scheduled",
+    "start_iso":"2025-09-05T16:00:00",
+    "end_iso":"2025-09-05T16:30:00",
+    "timezone":"America/Chicago",
+    "attendees":[{"email":"alex@contoso.com"}],
+    "is_online_meeting": true
+  }'
+
+# Online Meeting
+curl -X POST http://localhost:8080/online-meetings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id":"organizer@contoso.com",
+    "subject":"Nora App-only Meeting",
+    "start_iso":"2025-09-05T17:00:00",
+    "end_iso":"2025-09-05T17:30:00"
+  }'
+
+# Meeting schedule follow-up
+# Pull attendance
+curl "http://localhost:8080/online-meetings/organizer@contoso.com/<MEETING_ID>/attendance"
+
+# Build a follow-up from attendees
+curl -X POST http://localhost:8080/online-meetings/followup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "organizer_user_id":"organizer@contoso.com",
+    "online_meeting_id":"<MEETING_ID>",
+    "start_iso":"2025-09-06T17:00:00",
+    "end_iso":"2025-09-06T17:30:00",
+    "subject":"Follow-up: decisions & actions"
+  }'
+
+# Create channel
+curl -X POST http://localhost:8080/teams/channels \
+  -H "Content-Type: application/json" \
+  -d '{"team_id":"<TEAM_ID>","display_name":"planning","description":"Sprint planning"}'
+
+# Post channel message (HTML ok)
+curl -X POST http://localhost:8080/teams/channels/message \
+  -H "Content-Type: application/json" \
+  -d '{"team_id":"<TEAM_ID>","channel_id":"<CHANNEL_ID>","content":"<b>Reminder</b>: Retro at 4pm"}'
+

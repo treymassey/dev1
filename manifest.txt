@@ -1,0 +1,31 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "id": "<YOUR_AAD_APP_CLIENT_ID>",
+  "packageName": "com.contoso.nora-rsc",
+  "name": { "short": "Nora RSC", "full": "Nora Resource-Specific Consent App" },
+  "developer": {
+    "name": "Your Org",
+    "websiteUrl": "https://contoso.com",
+    "privacyUrl": "https://contoso.com/privacy",
+    "termsOfUseUrl": "https://contoso.com/terms"
+  },
+  "description": {
+    "short": "Grants this app permission to post in this team.",
+    "full": "Installs Nora RSC in a team to allow ChannelMessage.Send.Group and Channel.Create.Group in that team only."
+  },
+  "icons": { "outline": "outline.png", "color": "color.png" },
+  "accentColor": "#6264A7",
+  "webApplicationInfo": {
+    "id": "<YOUR_AAD_APP_CLIENT_ID>",
+    "resource": "api://<YOUR_AAD_APP_CLIENT_ID>"
+  },
+  "authorization": {
+    "permissions": {
+      "resourceSpecific": [
+        { "name": "ChannelMessage.Send.Group", "type": "Application" },
+        { "name": "Channel.Create.Group", "type": "Application" }
+      ]
+    }
+  }
+}

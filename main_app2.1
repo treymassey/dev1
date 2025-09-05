@@ -1,0 +1,113 @@
+# app version2.1 - with ID queries
+
+# Microsoft Graph App-Only Service (FastAPI) — App Permissions
+
+This version adds helper endpoints to **query Team IDs, Channel IDs, and Meeting IDs** directly from Graph, so you don’t have to run raw Graph queries.
+
+---
+
+## File: `app/main_app.py`
+
+```python
+# ... keep all previous imports and helpers ...
+
+# --------------------------- Teams Discovery ---------------------------
+@app.get("/teams")
+def list_teams(top: int = 50):
+    """List all Teams (groupId == Team ID)."""
+    result = graph_request(
+        "GET",
+        "/groups",
+        params={
+            "$filter": "resourceProvisioningOptions/Any(x:x eq 'Team')",
+            "$select": "id,displayName",
+            "$top": top,
+        },
+    )
+    return {"ok": True, "teams": result.get("value", [])}
+
+
+@app.get("/teams/{team_id}/channels")
+def list_channels(team_id: str, top: int = 50):
+    """List channels for a given Team."""
+    result = graph_request(
+        "GET",
+        f"/teams/{team_id}/channels",
+        params={"$select": "id,displayName", "$top": top},
+    )
+    return {"ok": True, "channels": result.get("value", [])}
+
+
+# --------------------------- Meetings Discovery ---------------------------
+@app.get("/users/{user_id}/meetings")
+def list_online_meetings(user_id: str, start: str, end: str, top: int = 50):
+    """
+    List online meetings for a user in a date range.
+    Requires OnlineMeetings.ReadWrite.All and AAP for that user.
+    """
+    result = graph_request(
+        "GET",
+        f"/users/{user_id}/onlineMeetings",
+        params={
+            "startDateTime": start,
+            "endDateTime": end,
+            "$top": top,
+        },
+    )
+    return {"ok": True, "meetings": result.get("value", [])}
+
+
+@app.get("/users/{user_id}/events")
+def list_calendar_events(user_id: str, start: str, end: str, online_only: bool = True, top: int = 50):
+    """
+    List calendar events for a user, optionally filtering only online meetings.
+    Requires Calendars.Read or Calendars.ReadWrite (Application).
+    """
+    filter_str = f"start/dateTime ge '{start}' and end/dateTime le '{end}'"
+    if online_only:
+        filter_str = f"isOnlineMeeting eq true and {filter_str}"
+
+    result = graph_request(
+        "GET",
+        f"/users/{user_id}/events",
+        params={
+            "$filter": filter_str,
+            "$expand": "onlineMeeting",
+            "$select": "id,subject,start,end,onlineMeeting",
+            "$top": top,
+        },
+    )
+    return {"ok": True, "events": result.get("value", [])}
+```
+
+---
+
+## Usage Examples
+
+### List all Teams
+
+```bash
+curl http://localhost:8080/teams
+```
+
+### List Channels in a Team
+
+```bash
+curl http://localhost:8080/teams/<TEAM_ID>/channels
+```
+
+### List Online Meetings for a User (by date range)
+
+```bash
+curl "http://localhost:8080/users/organizer@contoso.com/meetings?start=2025-09-05T00:00:00Z&end=2025-09-06T00:00:00Z"
+```
+
+### List Calendar Events (with joinUrl)
+
+```bash
+curl "http://localhost:8080/users/organizer@contoso.com/events?start=2025-09-05T00:00:00&end=2025-09-06T00:00:00"
+```
+
+---
+
+These endpoints make it trivial to query **Team IDs**, **Channel IDs**, and **Meeting IDs** directly through your containerized service, without raw Graph calls.

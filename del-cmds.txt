@@ -9,14 +9,47 @@ curl -X POST http://localhost:8080/chats/send \
     "message": "<b>Hello from delegated!</b>"
   }'
 
-
-cat > chat.json <<'EOF'
+#teams
+cat > channel-msg.json <<'EOF'
 {
-  "recipient_upn": "ramassey@GPSEXperimentationSandbox.onmicrosoft.com",
-  "message": "Hello via delegated chat API!"
+  "team_id": "<TEAM_ID>",
+  "channel_id": "<CHANNEL_ID>",
+  "message": "Hello from Codespace (delegated)"
 }
 EOF
 
-curl -X POST http://localhost:8080/send-chat-delegated \
+curl -X POST http://localhost:8080/send-channel-message-delegated \
   -H "Content-Type: application/json" \
-  --data-binary @chat.json
+  --data-binary @channel-msg.json
+
+
+
+# email
+
+cat > email.json <<'EOF'
+{
+  "to": ["ramassey@deloitte.com"],
+  "subject": "Massey - Graph API Test",
+  "body_html": "<b>Testing</b><br/>Still need to work out permissions for calendars.<br/>This is a test email via Graph + FastAPI."
+}
+EOF
+
+curl -X POST http://localhost:8080/send-email-delegated \
+  -H "Content-Type: application/json" \
+  --data-binary @email.json
+
+
+
+#Meeting
+cat > meeting.json <<'EOF'
+{
+  "subject": "Codespaces Sync",
+  "start_iso": "2025-09-07T12:00:00",
+  "end_iso":   "2025-09-07T12:30:00",
+  "attendees": ["someone@external.com"]
+}
+EOF
+
+curl -X POST http://localhost:8080/schedule-meeting-delegated \
+  -H "Content-Type: application/json" \
+  --data-binary @meeting.json

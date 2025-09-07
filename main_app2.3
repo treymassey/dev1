@@ -1,0 +1,399 @@
+# app/main_app.py
+# Microsoft Graph - FastAPI service
+# Supports BOTH:
+#   - Application permissions (client credentials)
+#   - Delegated permissions (OAuth auth-code flow)
+#
+# Env:
+#   TENANT_ID            = <GUID> or 'organizations'
+#   CLIENT_ID            = App (client) ID
+#   CLIENT_SECRET        = Client secret (Value)
+#   REDIRECT_URI         = e.g. http://localhost:8080/auth/callback
+#   AUTH_TENANT          = <tenantId or 'organizations'>  (optional; defaults to TENANT_ID)
+#
+# Notes:
+# - For Teams channel posts (app-only) you still need RSC via Teams app manifest installed in the team.
+# - For 1:1 or group chats you must use DELEGATED (user-consented) Chat.ReadWrite scope.
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+import os, time, json, urllib.parse, requests
+
+app = FastAPI(title="Graph App (App + Delegated)", version="2.0.0")
+
+GRAPH = "https://graph.microsoft.com/v1.0"
+
+TENANT_ID = os.getenv("TENANT_ID", "")
+CLIENT_ID = os.getenv("CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8080/auth/callback")
+AUTH_TENANT = os.getenv("AUTH_TENANT", TENANT_ID or "organizations")
+
+if not CLIENT_ID:
+    raise RuntimeError("CLIENT_ID env var is required")
+
+# -----------------------------------------------------------------------------
+# Simple in-memory delegated token store (dev-only). Replace with a DB in prod.
+# Keys are the user's AAD object id ("oid") or UPN; values hold token JSON.
+# -----------------------------------------------------------------------------
+DELEGATED_TOKENS: Dict[str, Dict[str, Any]] = {}
+
+# ============================  APP-ONLY TOKEN  ================================
+
+APP_TOKEN_CACHE = "/tmp/app_token.cache"
+
+def get_app_token() -> str:
+    """Client credentials token for Graph (.default)."""
+    # tiny cache
+    if os.path.exists(APP_TOKEN_CACHE):
+        try:
+            data = json.load(open(APP_TOKEN_CACHE))
+            if data.get("exp", 0) > int(time.time()) + 60:
+                return data["access_token"]
+        except Exception:
+            pass
+
+    tenant = TENANT_ID or "organizations"
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    resp = requests.post(
+        token_url,
+        data={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"app token error: {resp.status_code} {resp.text}")
+    tok = resp.json()
+    json.dump({"access_token": tok["access_token"], "exp": int(time.time()) + int(tok.get("expires_in", 3600))}, open(APP_TOKEN_CACHE, "w"))
+    return tok["access_token"]
+
+
+def graph_app_request(method: str, path: str, params=None, json_body=None):
+    url = GRAPH + path
+    headers = {"Authorization": f"Bearer {get_app_token()}", "Content-Type": "application/json"}
+    r = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=60)
+    if not r.ok:
+        try:
+            payload = r.json()
+        except Exception:
+            payload = r.text
+        full = requests.Request(method, url, params=params).prepare().url
+        raise HTTPException(status_code=r.status_code, detail={"url": full, "response": payload})
+    return r.json() if r.text else {}
+
+# ============================  DELEGATED TOKEN  ===============================
+
+# Delegated scopes needed for Teams chat + basic user info (add others as needed)
+DELEGATED_SCOPES = [
+    "openid",
+    "profile",
+    "offline_access",
+    "User.Read",
+    "Chat.ReadWrite"  # <-- send/read chat as the user
+]
+
+def token_endpoint(tenant_for_auth: str) -> str:
+    return f"https://login.microsoftonline.com/{tenant_for_auth}/oauth2/v2.0/token"
+
+def authorize_endpoint(tenant_for_auth: str) -> str:
+    return f"https://login.microsoftonline.com/{tenant_for_auth}/oauth2/v2.0/authorize"
+
+def exchange_code_for_tokens(code: str) -> Dict[str, Any]:
+    url = token_endpoint(AUTH_TENANT or "organizations")
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "scope": " ".join(DELEGATED_SCOPES),
+    }
+    r = requests.post(url, data=data, timeout=30)
+    if not r.ok:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    return r.json()
+
+def refresh_delegated_token(refresh_token: str) -> Dict[str, Any]:
+    url = token_endpoint(AUTH_TENANT or "organizations")
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "redirect_uri": REDIRECT_URI,
+        "scope": " ".join(DELEGATED_SCOPES),
+    }
+    r = requests.post(url, data=data, timeout=30)
+    if not r.ok:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    return r.json()
+
+def delegated_token_for(user_key: str) -> str:
+    """
+    Get a valid delegated access token for a previously-signed-in user.
+    user_key can be their AAD oid (preferred) or UPN you stored at login.
+    """
+    tok = DELEGATED_TOKENS.get(user_key)
+    if not tok:
+        raise HTTPException(status_code=401, detail="No delegated session for this user. Visit /auth/login to sign in.")
+    # refresh if expiring
+    expires_at = tok.get("expires_at", 0)
+    if expires_at <= int(time.time()) + 60:
+        new_tok = refresh_delegated_token(tok["refresh_token"])
+        tok = {
+            **tok,
+            "access_token": new_tok["access_token"],
+            "refresh_token": new_tok.get("refresh_token", tok["refresh_token"]),
+            "expires_at": int(time.time()) + int(new_tok.get("expires_in", 3600)),
+        }
+        DELEGATED_TOKENS[user_key] = tok
+    return tok["access_token"]
+
+def graph_delegated_request(user_key: str, method: str, path: str, params=None, json_body=None):
+    url = GRAPH + path
+    headers = {"Authorization": f"Bearer {delegated_token_for(user_key)}", "Content-Type": "application/json"}
+    r = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=60)
+    if not r.ok:
+        try:
+            payload = r.json()
+        except Exception:
+            payload = r.text
+        full = requests.Request(method, url, params=params).prepare().url
+        raise HTTPException(status_code=r.status_code, detail={"url": full, "response": payload})
+    return r.json() if r.text else {}
+
+# ============================  MODELS  =======================================
+
+class EmailAddress(BaseModel):
+    address: str
+    name: Optional[str] = None
+
+class SendMailBody(BaseModel):
+    from_user_id: str
+    to: List[EmailAddress]
+    subject: str
+    html_body: str
+
+class CreateEventBody(BaseModel):
+    user_id: str
+    subject: str
+    start_iso: str
+    end_iso: str
+    timezone: Optional[str] = "UTC"
+    body_html: Optional[str] = ""
+    attendees: List[EmailAddress] = []
+    is_online_meeting: bool = True
+
+class OnlineMeetingBody(BaseModel):
+    user_id: str
+    subject: str
+    start_iso: str
+    end_iso: str
+
+class PostChannelMessageBody(BaseModel):
+    team_id: str
+    channel_id: str
+    content: str
+
+class ChatToUserBody(BaseModel):
+    """Delegated: send a Teams chat to a user (creates chat if needed)."""
+    sender_user_key: str = Field(..., description="The signed-in user key used at login (oid or UPN).")
+    to_upn: str
+    message: str
+
+# ============================  HEALTH  =======================================
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "time": int(time.time())}
+
+# ============================  AUTH (DELEGATED)  =============================
+
+@app.get("/auth/login")
+def auth_login():
+    """
+    Starts OAuth authorization-code flow for delegated permissions.
+    Add REDIRECT_URI to your app registration (Web redirect).
+    """
+    auth_url = authorize_endpoint(AUTH_TENANT or "organizations")
+    params = {
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "response_mode": "query",
+        "scope": " ".join(DELEGATED_SCOPES),
+        "state": "xyz",  # replace with real state/nonce in prod
+    }
+    return RedirectResponse(auth_url + "?" + urllib.parse.urlencode(params))
+
+
+@app.get("/auth/callback")
+def auth_callback(code: Optional[str] = None, state: Optional[str] = None):
+    """
+    OAuth redirect target. Exchanges code for tokens, stores them in memory,
+    and returns the signed-in user's oid & upn so you can use it as sender_user_key.
+    """
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing 'code' in callback.")
+    tokens = exchange_code_for_tokens(code)
+
+    access_token = tokens["access_token"]
+    # Identify the user
+    me = requests.get(GRAPH + "/me", headers={"Authorization": f"Bearer {access_token}"}).json()
+    user_key = me.get("id") or me.get("userPrincipalName")  # prefer oid
+    if not user_key:
+        raise HTTPException(status_code=500, detail="Unable to resolve user identity from /me.")
+
+    DELEGATED_TOKENS[user_key] = {
+        "access_token": access_token,
+        "refresh_token": tokens.get("refresh_token"),
+        "expires_at": int(time.time()) + int(tokens.get("expires_in", 3600)),
+        "upn": me.get("userPrincipalName"),
+        "name": me.get("displayName"),
+    }
+    return {
+        "ok": True,
+        "message": "Delegated sign-in complete. Use this user_key in chat APIs.",
+        "user_key": user_key,
+        "upn": me.get("userPrincipalName"),
+        "name": me.get("displayName"),
+        "scopes": DELEGATED_SCOPES,
+    }
+
+# ============================  MAIL (APP-ONLY)  ==============================
+
+@app.post("/mail/send")
+def send_mail(body: SendMailBody):
+    payload = {
+        "message": {
+            "subject": body.subject,
+            "body": {"contentType": "HTML", "content": body.html_body},
+            "toRecipients": [{"emailAddress": e.dict()} for e in body.to],
+        },
+        "saveToSentItems": "true",
+    }
+    result = graph_app_request("POST", f"/users/{body.from_user_id}/sendMail", json_body=payload)
+    return {"ok": True, "result": result}
+
+# ============================  EVENTS / MEETINGS (APP-ONLY)  =================
+
+@app.post("/events")
+def create_event(body: CreateEventBody):
+    attendees = [
+        {"emailAddress": {"address": a.address, "name": a.name or a.address}, "type": "required"}
+        for a in body.attendees
+    ]
+    payload = {
+        "subject": body.subject,
+        "body": {"contentType": "HTML", "content": body.body_html or ""},
+        "start": {"dateTime": body.start_iso, "timeZone": body.timezone},
+        "end": {"dateTime": body.end_iso, "timeZone": body.timezone},
+        "attendees": attendees,
+        "isOnlineMeeting": bool(body.is_online_meeting),
+        "onlineMeetingProvider": "teamsForBusiness",
+    }
+    created = graph_app_request("POST", f"/users/{body.user_id}/events", json_body=payload)
+    ev_id = created.get("id")
+    if ev_id:
+        created = graph_app_request(
+            "GET",
+            f"/users/{body.user_id}/events/{ev_id}",
+            params={"$expand": "onlineMeeting", "$select": "id,subject,onlineMeeting"}
+        )
+    return {"ok": True, "event": created}
+
+@app.post("/online-meetings")
+def create_online_meeting(body: OnlineMeetingBody):
+    payload = {"subject": body.subject, "startDateTime": body.start_iso, "endDateTime": body.end_iso}
+    r = graph_app_request("POST", f"/users/{body.user_id}/onlineMeetings", json_body=payload)
+    return {"ok": True, "onlineMeeting": r}
+
+# ============================  TEAMS CHANNELS (APP-ONLY + RSC) ===============
+
+@app.post("/teams/channels/message")
+def post_channel_message(body: PostChannelMessageBody):
+    """
+    App-only channel post; requires RSC ChannelMessage.Send.Group & app installed in the team.
+    """
+    payload = {"body": {"contentType": "html", "content": body.content}}
+    r = graph_app_request("POST", f"/teams/{body.team_id}/channels/{body.channel_id}/messages", json_body=payload)
+    return {"ok": True, "message": r}
+
+# ============================  DISCOVERY (APP-ONLY) ===========================
+
+@app.get("/teams")
+def list_teams(top: int = 50):
+    r = graph_app_request(
+        "GET",
+        "/groups",
+        params={"$filter": "resourceProvisioningOptions/Any(x:x eq 'Team')", "$select": "id,displayName", "$top": top},
+    )
+    return {"ok": True, "teams": r.get("value", [])}
+
+@app.get("/teams/{team_id}/channels")
+def list_channels(team_id: str, top: int = 50):
+    r = graph_app_request("GET", f"/teams/{team_id}/channels", params={"$select": "id,displayName,description", "$top": top})
+    return {"ok": True, "channels": r.get("value", [])}
+
+@app.get("/users/{user_id}/events")
+def list_calendar_events(user_id: str, start: str, end: str, online_only: bool = True, top: int = 50):
+    filt = f"start/dateTime ge '{start}' and end/dateTime le '{end}'"
+    if online_only:
+        filt = f"isOnlineMeeting eq true and {filt}"
+    r = graph_app_request(
+        "GET",
+        f"/users/{user_id}/events",
+        params={"$filter": filt, "$expand": "onlineMeeting", "$select": "id,subject,start,end,onlineMeeting", "$top": top},
+    )
+    return {"ok": True, "events": r.get("value", [])}
+
+# ============================  DELEGATED TEAMS CHAT  ==========================
+# Send a Teams chat message AS the signed-in user (delegated).
+
+def get_user_id_by_upn(user_key: str, upn: str) -> str:
+    u = graph_delegated_request(user_key, "GET", f"/users/{urllib.parse.quote(upn)}", params={"$select": "id,userPrincipalName"})
+    return u["id"]
+
+@app.post("/chats/send")
+def send_chat_to_user(body: ChatToUserBody):
+    """
+    Delegated: create a 1:1 chat with to_upn (if not exists) and send 'message'.
+    Requires delegated Chat.ReadWrite; the caller must have signed in via /auth/login.
+    The 'sender_user_key' is returned by /auth/callback (usually the user's oid).
+    """
+    # 1) Resolve target user id
+    target_id = get_user_id_by_upn(body.sender_user_key, body.to_upn)
+
+    # 2) Create (or get) a 1:1 chat
+    chat_payload = {
+        "chatType": "oneOnOne",
+        "members": [
+            {
+                "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                "roles": ["owner"],
+                "user@odata.bind": f"{GRAPH}/users/{target_id}"
+            },
+            {
+                "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                "roles": ["owner"],
+                # 'me' binding; Graph accepts 'me' for the signed-in user
+                "user@odata.bind": f"{GRAPH}/me"
+            }
+        ]
+    }
+    chat = graph_delegated_request(body.sender_user_key, "POST", "/chats", json_body=chat_payload)
+
+    chat_id = chat.get("id")
+    if not chat_id:
+        raise HTTPException(status_code=500, detail={"error": "Failed to create or resolve chat", "chat": chat})
+
+    # 3) Send the message
+    msg_payload = {"body": {"contentType": "html", "content": body.message}}
+    msg = graph_delegated_request(body.sender_user_key, "POST", f"/chats/{chat_id}/messages", json_body=msg_payload)
+    return {"ok": True, "chatId": chat_id, "message": msg}

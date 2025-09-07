@@ -8,3 +8,15 @@ curl -X POST http://localhost:8080/chats/send \
     "to_upn": "someone@yourtenant.com",
     "message": "<b>Hello from delegated!</b>"
   }'
+
+
+cat > chat.json <<'EOF'
+{
+  "recipient_upn": "ramassey@GPSEXperimentationSandbox.onmicrosoft.com",
+  "message": "Hello via delegated chat API!"
+}
+EOF
+
+curl -X POST http://localhost:8080/send-chat-delegated \
+  -H "Content-Type: application/json" \
+  --data-binary @chat.json

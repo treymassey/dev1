@@ -1,0 +1,10 @@
+
+#Send Teams to user
+
+curl -X POST http://localhost:8080/chats/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sender_user_key": "<user_key from /auth/callback>",
+    "to_upn": "someone@yourtenant.com",
+    "message": "<b>Hello from delegated!</b>"
+  }'

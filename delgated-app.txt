@@ -30,3 +30,7 @@ curl -X POST http://localhost:8080/mail/send \
     "subject": "App-only hello",
     "html_body": "<b>Hello</b>"
   }'
+
+curl -X POST http://localhost:8080/auth/device/poll \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "device_code=YOUR_DEVICE_CODE&interval=5"

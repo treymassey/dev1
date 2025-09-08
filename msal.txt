@@ -1,0 +1,23 @@
+@app.post("/auth/device-login")
+def device_login():
+    flow = public_app.initiate_device_flow(scopes=DELEGATED_SCOPES)
+
+    # If MSAL fails immediately, return its error instead of 500
+    if "user_code" not in flow:
+        raise HTTPException(status_code=400, detail=flow)
+
+    try:
+        result = public_app.acquire_token_by_device_flow(flow)  # blocks
+        save_cache()
+    except Exception as ex:
+        raise HTTPException(status_code=500, detail=str(ex))
+
+    if "access_token" not in result:
+        raise HTTPException(status_code=400, detail=result)
+
+    return {
+        "ok": True,
+        "account": result.get("id_token_claims"),
+        "scopes": result.get("scope"),
+        "note": "Tokens cached. Future calls will use silent refresh."
+    }

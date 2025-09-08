@@ -1,0 +1,32 @@
+curl -s -X POST http://localhost:8080/auth/device/start | jq .
+
+
+curl -s -X POST "http://localhost:8080/auth/device/poll?device_code=<PASTE_FROM_STEP_A>&interval=5" | jq .
+
+
+curl -X POST http://localhost:8080/chats/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sender_user_key": "<USER_KEY_FROM_DEVICE_POLL>",
+    "to_upn": "someone@yourtenant.com",
+    "message": "<b>Hello</b> from device-code delegated!"
+  }'
+
+# Teams Delegated
+curl -X POST http://localhost:8080/chats/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sender_user_key": "<USER_KEY_FROM_DEVICE_POLL>",
+    "to_upn": "someone@yourtenant.com",
+    "message": "<b>Hello</b> from device-code delegated!"
+  }'
+
+# Mail App
+curl -X POST http://localhost:8080/mail/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_user_id": "sender@yourtenant.com",
+    "to": [{"address":"recipient@yourtenant.com"}],
+    "subject": "App-only hello",
+    "html_body": "<b>Hello</b>"
+  }'

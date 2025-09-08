@@ -1,0 +1,3 @@
+# send a 1:1 chat
+$body = @{ to_upn="someone@yourorg.com"; message="Hello from MSAL ✅" } | ConvertTo-Json
+Invoke-RestMethod -Method POST -Uri http://localhost:8080/chats/send -ContentType 'application/json' -Body $body

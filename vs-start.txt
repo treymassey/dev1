@@ -1,0 +1,21 @@
+# 1) install deps
+pip install fastapi uvicorn requests msal pydantic
+
+# 2) set env (PowerShell example)
+$env:TENANT_ID = "<tenant-guid-or-organizations>"
+$env:CLIENT_ID = "<app-client-id>"
+$env:CLIENT_SECRET = "<client-secret>"   # needed for APP-ONLY calls
+
+# 3) run
+uvicorn app.main_app:app --reload --host 0.0.0.0 --port 8080
+
+# 4) login (blocks until you finish browser step)
+curl -X POST http://localhost:8080/auth/device-login
+
+# 5) verify delegated token works
+curl http://localhost:8080/me
+
+# 6) send a 1:1 chat (delegated)
+curl -X POST http://localhost:8080/chats/send \
+  -H "Content-Type: application/json" \
+  -d '{"to_upn":"someone@yourorg.com","message":"Hello from MSAL ✅"}'

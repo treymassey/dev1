@@ -1,0 +1,49 @@
+@app.post("/chats/send")
+def send_chat_to_user(body: ChatToUserBody):
+    target_id = get_user_id_by_upn_delegated(body.to_upn)
+
+    chat_payload = {
+        "chatType": "oneOnOne",
+        "members": [
+            {
+                "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                "roles": ["owner"],
+                "user@odata.bind": f"{GRAPH}/users/{target_id}"
+            },
+            {
+                "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                "roles": ["owner"],
+                "user@odata.bind": f"{GRAPH}/me"
+            }
+        ]
+    }
+
+    # 👇 Force raw JSON to preserve keys
+    resp = requests.post(
+        GRAPH + "/chats",
+        headers={
+            "Authorization": f"Bearer {get_user_token()}",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(chat_payload),  # use `data` not `json=`
+        timeout=60,
+    )
+    if not resp.ok:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+
+    chat = resp.json()
+    chat_id = chat.get("id")
+
+    msg_payload = {"body": {"contentType": "html", "content": body.message}}
+    resp = requests.post(
+        GRAPH + f"/chats/{chat_id}/messages",
+        headers={
+            "Authorization": f"Bearer {get_user_token()}",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(msg_payload),
+        timeout=60,
+    )
+    if not resp.ok:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+    return {"ok": True, "chatId": chat_id, "message": resp.json()}

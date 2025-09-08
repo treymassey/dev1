@@ -1,0 +1,423 @@
+# app/main_app.py
+# Microsoft Graph - FastAPI service
+# Modes:
+#   1) Application permissions (client credentials)  -> mail/events/teams (app-only)
+#   2) Delegated permissions via MSAL Device Code    -> /me, 1:1 chat, etc. (user-consent)
+#
+# Env:
+#   TENANT_ID      = <GUID> or 'organizations'
+#   CLIENT_ID      = App (client) ID
+#   CLIENT_SECRET  = Client secret (Value)  [needed for APP-ONLY calls]
+#   AUTH_TENANT    = <tenantId or 'organizations'>  (optional; defaults to TENANT_ID)
+#
+# Azure prerequisites (Delegated / Device Code):
+#   - App registration > Authentication > "Allow public client flows" = Yes
+#   - Delegated Graph perms (grant consent): User.Read, Chat.ReadWrite, (optional: ChannelMessage.Send,
+#     Mail.Send, Calendars.ReadWrite), plus openid, profile, offline_access.
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from threading import Thread
+import os, time, json, urllib.parse, requests
+
+from msal import PublicClientApplication, SerializableTokenCache
+
+app = FastAPI(title="Graph App (App + MSAL DeviceCode Delegated)", version="5.0.0")
+
+GRAPH = "https://graph.microsoft.com/v1.0"
+
+TENANT_ID = os.getenv("TENANT_ID", "")
+CLIENT_ID = os.getenv("CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "")
+AUTH_TENANT = os.getenv("AUTH_TENANT", TENANT_ID or "organizations")
+
+if not CLIENT_ID:
+    raise RuntimeError("CLIENT_ID env var is required")
+
+# ---------------------------------------------------------------------------
+# MSAL (Delegated) - non-blocking device code flow with persistent cache
+# ---------------------------------------------------------------------------
+DELEGATED_SCOPES = [
+    "User.Read",
+    "Chat.ReadWrite",
+    # Optional delegated scopes if you plan to use these via delegated:
+    "ChannelMessage.Send",
+    "Mail.Send",
+    "Calendars.ReadWrite",
+    # OIDC / offline:
+    "openid",
+    "profile",
+    "offline_access",
+]
+
+CACHE_PATH = "token-cache.json"
+token_cache = SerializableTokenCache()
+try:
+    with open(CACHE_PATH, "r") as f:
+        token_cache.deserialize(f.read())
+except FileNotFoundError:
+    pass
+
+def save_cache():
+    if token_cache.has_state_changed:
+        with open(CACHE_PATH, "w") as f:
+            f.write(token_cache.serialize())
+
+public_app = PublicClientApplication(
+    CLIENT_ID,
+    authority=f"https://login.microsoftonline.com/{AUTH_TENANT}",
+    token_cache=token_cache,
+)
+
+def get_user_token() -> str:
+    """
+    Returns a valid delegated access token from the MSAL cache (silent refresh).
+    Requires the device-code flow to have completed at least once.
+    """
+    accounts = public_app.get_accounts()
+    if accounts:
+        result = public_app.acquire_token_silent(DELEGATED_SCOPES, account=accounts[0])
+        if result and "access_token" in result:
+            return result["access_token"]
+    raise HTTPException(status_code=401, detail="No delegated token—run /auth/device-start then /auth/device-complete and finish the browser step")
+
+def graph_delegated_request(method: str, path: str, params=None, json_body=None):
+    url = GRAPH + path
+    headers = {"Authorization": f"Bearer {get_user_token()}", "Content-Type": "application/json"}
+    r = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=60)
+    if not r.ok:
+        try:
+            payload = r.json()
+        except Exception:
+            payload = r.text
+        full = requests.Request(method, url, params=params).prepare().url
+        raise HTTPException(status_code=r.status_code, detail={"url": full, "response": payload})
+    return r.json() if r.text else {}
+
+# Non-blocking device flow state (dev-only; replace with durable store if needed)
+LAST_FLOW: Dict[str, Any] = {}
+LOGIN_THREAD: Optional[Thread] = None
+LOGIN_RESULT: Optional[Dict[str, Any]] = None
+
+def _blocking_login():
+    global LOGIN_RESULT
+    try:
+        LOGIN_RESULT = public_app.acquire_token_by_device_flow(LAST_FLOW)  # blocks until browser completes
+        save_cache()
+    except Exception as ex:
+        LOGIN_RESULT = {"error": "exception", "error_description": str(ex)}
+
+# ---------------------------------------------------------------------------
+# App-only token (client credentials) with tiny file cache
+# ---------------------------------------------------------------------------
+APP_TOKEN_CACHE = "/tmp/app_token.cache"
+
+def get_app_token() -> str:
+    """Client credentials token for Graph (.default)."""
+    if os.path.exists(APP_TOKEN_CACHE):
+        try:
+            data = json.load(open(APP_TOKEN_CACHE))
+            if data.get("exp", 0) > int(time.time()) + 60:
+                return data["access_token"]
+        except Exception:
+            pass
+
+    tenant = TENANT_ID or "organizations"
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    resp = requests.post(
+        token_url,
+        data={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"app token error: {resp.status_code} {resp.text}")
+    tok = resp.json()
+    json.dump(
+        {"access_token": tok["access_token"], "exp": int(time.time()) + int(tok.get("expires_in", 3600))},
+        open(APP_TOKEN_CACHE, "w"),
+    )
+    return tok["access_token"]
+
+def graph_app_request(method: str, path: str, params=None, json_body=None):
+    url = GRAPH + path
+    headers = {"Authorization": f"Bearer {get_app_token()}", "Content-Type": "application/json"}
+    r = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=60)
+    if not r.ok:
+        try:
+            payload = r.json()
+        except Exception:
+            payload = r.text
+        full = requests.Request(method, url, params=params).prepare().url
+        raise HTTPException(status_code=r.status_code, detail={"url": full, "response": payload})
+    return r.json() if r.text else {}
+
+# ---------------------------------------------------------------------------
+# MODELS
+# ---------------------------------------------------------------------------
+class EmailAddress(BaseModel):
+    address: str
+    name: Optional[str] = None
+
+class SendMailBody(BaseModel):
+    # For APP-ONLY send, this is the target mailbox user id (GUID or UPN)
+    from_user_id: str
+    to: List[EmailAddress]
+    subject: str
+    html_body: str
+
+class CreateEventBody(BaseModel):
+    user_id: str
+    subject: str
+    start_iso: str
+    end_iso: str
+    timezone: Optional[str] = "UTC"
+    body_html: Optional[str] = ""
+    attendees: List[EmailAddress] = []
+    is_online_meeting: bool = True
+
+class OnlineMeetingBody(BaseModel):
+    user_id: str
+    subject: str
+    start_iso: str
+    end_iso: str
+
+class PostChannelMessageBody(BaseModel):
+    team_id: str
+    channel_id: str
+    content: str
+
+class ChatToUserBody(BaseModel):
+    to_upn: str = Field(..., description="UPN/email of the recipient")
+    message: str
+
+# ---------------------------------------------------------------------------
+# HEALTH
+# ---------------------------------------------------------------------------
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "time": int(time.time())}
+
+# ---------------------------------------------------------------------------
+# AUTH (Delegated via MSAL Device Code - non-blocking 3-step flow)
+# ---------------------------------------------------------------------------
+@app.get("/auth/status")
+def auth_status():
+    accounts = [a.get("username") for a in public_app.get_accounts()]
+    return {"ok": True, "accounts": accounts, "cache": os.path.abspath(CACHE_PATH)}
+
+@app.post("/auth/device-start")
+def device_start():
+    """
+    Start device flow and return user_code + verification URI immediately (non-blocking).
+    """
+    global LAST_FLOW, LOGIN_THREAD, LOGIN_RESULT
+    LOGIN_RESULT = None
+    LAST_FLOW = public_app.initiate_device_flow(scopes=DELEGATED_SCOPES)
+    if "user_code" not in LAST_FLOW:
+        # Surface MSAL error directly (e.g., unauthorized_client, invalid_scope)
+        raise HTTPException(status_code=400, detail=LAST_FLOW)
+
+    # Also print to server logs (useful in Docker)
+    print(LAST_FLOW.get("message"))
+
+    return {
+        "ok": True,
+        "user_code": LAST_FLOW["user_code"],
+        "verification_uri": LAST_FLOW["verification_uri"],
+        "message": LAST_FLOW["message"],
+        "expires_in": LAST_FLOW.get("expires_in", 900),
+        "interval": LAST_FLOW.get("interval", 5),
+        "note": "Open verification_uri and enter user_code, then call /auth/device-complete and poll /auth/device-status."
+    }
+
+@app.post("/auth/device-complete")
+def device_complete():
+    """
+    Start the blocking MSAL acquire_token_by_device_flow in a background thread.
+    """
+    global LOGIN_THREAD, LOGIN_RESULT
+    if not LAST_FLOW:
+        raise HTTPException(status_code=400, detail="No device flow in progress. Call /auth/device-start first.")
+
+    # Already running?
+    if LOGIN_THREAD and LOGIN_THREAD.is_alive():
+        return {"ok": False, "status": "pending"}
+
+    LOGIN_RESULT = None
+    LOGIN_THREAD = Thread(target=_blocking_login, daemon=True)
+    LOGIN_THREAD.start()
+    return {"ok": True, "status": "pending"}
+
+@app.get("/auth/device-status")
+def device_status():
+    """
+    Poll until login finishes. Returns success with id token claims or error details.
+    """
+    if LOGIN_RESULT is None:
+        return {"ok": False, "status": "pending"}
+    if "access_token" in LOGIN_RESULT:
+        return {
+            "ok": True,
+            "status": "success",
+            "account": LOGIN_RESULT.get("id_token_claims"),
+            "scopes": LOGIN_RESULT.get("scope"),
+            "note": "Tokens cached; delegated calls will use silent refresh."
+        }
+    return {"ok": False, "status": "error", "detail": LOGIN_RESULT}
+
+@app.post("/auth/logout")
+def logout():
+    """
+    Clears cached accounts/tokens. Next delegated call will require the device flow again.
+    """
+    for acct in public_app.get_accounts():
+        public_app.remove_account(acct)
+    save_cache()
+    try:
+        os.remove(CACHE_PATH)
+    except FileNotFoundError:
+        pass
+    return {"ok": True, "message": "Delegated token cache cleared."}
+
+# ---------------------------------------------------------------------------
+# SIMPLE DELEGATED HELPERS
+# ---------------------------------------------------------------------------
+@app.get("/me")
+def me():
+    """Delegated: who am I? (verifies token works)"""
+    return graph_delegated_request("GET", "/me", params={"$select": "id,displayName,userPrincipalName"})
+
+def get_user_id_by_upn_delegated(upn: str) -> str:
+    u = graph_delegated_request("GET", f"/users/{urllib.parse.quote(upn)}", params={"$select": "id,userPrincipalName"})
+    return u["id"]
+
+@app.post("/chats/send")
+def send_chat_to_user(body: ChatToUserBody):
+    """
+    Delegated: create (if needed) a 1:1 chat with to_upn and send 'message'.
+    Requires delegated Chat.ReadWrite; some tenants may additionally require User.ReadBasic.All/User.Read.All for user lookup.
+    """
+    target_id = get_user_id_by_upn_delegated(body.to_upn)
+
+    chat_payload = {
+        "chatType": "oneOnOne",
+        "members": [
+            {
+                "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                "roles": ["owner"],
+                "user@odata.bind": f"{GRAPH}/users/{target_id}"
+            },
+            {
+                "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                "roles": ["owner"],
+                "user@odata.bind": f"{GRAPH}/me"
+            }
+        ]
+    }
+    chat = graph_delegated_request("POST", "/chats", json_body=chat_payload)
+    chat_id = chat.get("id")
+    if not chat_id:
+        raise HTTPException(status_code=500, detail={"error": "Failed to create or resolve chat", "chat": chat})
+
+    msg_payload = {"body": {"contentType": "html", "content": body.message}}
+    msg = graph_delegated_request("POST", f"/chats/{chat_id}/messages", json_body=msg_payload)
+    return {"ok": True, "chatId": chat_id, "message": msg}
+
+# ---------------------------------------------------------------------------
+# APP-ONLY: Mail / Events / Meetings / Teams Channels
+# ---------------------------------------------------------------------------
+@app.post("/mail/send")
+def send_mail(body: SendMailBody):
+    """
+    App-only sendMail as another user (requires Application Mail.Send with admin consent).
+    """
+    payload = {
+        "message": {
+            "subject": body.subject,
+            "body": {"contentType": "HTML", "content": body.html_body},
+            "toRecipients": [{"emailAddress": e.dict()} for e in body.to],
+        },
+        "saveToSentItems": "true",
+    }
+    result = graph_app_request("POST", f"/users/{body.from_user_id}/sendMail", json_body=payload)
+    return {"ok": True, "result": result}
+
+@app.post("/events")
+def create_event(body: CreateEventBody):
+    """
+    App-only: create event on a user's calendar (requires Calendars.ReadWrite application permission).
+    """
+    attendees = [
+        {"emailAddress": {"address": a.address, "name": a.name or a.address}, "type": "required"}
+        for a in body.attendees
+    ]
+    payload = {
+        "subject": body.subject,
+        "body": {"contentType": "HTML", "content": body.body_html or ""},
+        "start": {"dateTime": body.start_iso, "timeZone": body.timezone},
+        "end": {"dateTime": body.end_iso, "timeZone": body.timezone},
+        "attendees": attendees,
+        "isOnlineMeeting": bool(body.is_online_meeting),
+        "onlineMeetingProvider": "teamsForBusiness",
+    }
+    created = graph_app_request("POST", f"/users/{body.user_id}/events", json_body=payload)
+    ev_id = created.get("id")
+    if ev_id:
+        created = graph_app_request(
+            "GET",
+            f"/users/{body.user_id}/events/{ev_id}",
+            params={"$expand": "onlineMeeting", "$select": "id,subject,onlineMeeting"}
+        )
+    return {"ok": True, "event": created}
+
+@app.post("/online-meetings")
+def create_online_meeting(body: OnlineMeetingBody):
+    """
+    App-only: create an online meeting on behalf of a user (requires OnlineMeetings.ReadWrite.All application permission).
+    """
+    payload = {"subject": body.subject, "startDateTime": body.start_iso, "endDateTime": body.end_iso}
+    r = graph_app_request("POST", f"/users/{body.user_id}/onlineMeetings", json_body=payload)
+    return {"ok": True, "onlineMeeting": r}
+
+@app.post("/teams/channels/message")
+def post_channel_message(body: PostChannelMessageBody):
+    """
+    App-only channel post; requires:
+      - RSC permission ChannelMessage.Send.Group
+      - Your Teams app installed with that RSC in the target team
+    """
+    payload = {"body": {"contentType": "html", "content": body.content}}
+    r = graph_app_request("POST", f"/teams/{body.team_id}/channels/{body.channel_id}/messages", json_body=payload)
+    return {"ok": True, "message": r}
+
+@app.get("/teams")
+def list_teams(top: int = 50):
+    r = graph_app_request(
+        "GET",
+        "/groups",
+        params={"$filter": "resourceProvisioningOptions/Any(x:x eq 'Team')", "$select": "id,displayName", "$top": top},
+    )
+    return {"ok": True, "teams": r.get("value", [])}
+
+@app.get("/teams/{team_id}/channels")
+def list_channels(team_id: str, top: int = 50):
+    r = graph_app_request("GET", f"/teams/{team_id}/channels", params={"$select": "id,displayName,description", "$top": top})
+    return {"ok": True, "channels": r.get("value", [])}
+
+@app.get("/users/{user_id}/events")
+def list_calendar_events(user_id: str, start: str, end: str, online_only: bool = True, top: int = 50):
+    filt = f"start/dateTime ge '{start}' and end/dateTime le '{end}'"
+    if online_only:
+        filt = f"isOnlineMeeting eq true and {filt}"
+    r = graph_app_request(
+        "GET",
+        f"/users/{user_id}/events",
+        params={"$filter": filt, "$expand": "onlineMeeting", "$select": "id,subject,start,end,onlineMeeting", "$top": top},
+    )
+    return {"ok": True, "events": r.get("value", [])}

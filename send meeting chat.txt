@@ -25,3 +25,23 @@ curl -X POST "https://graph.microsoft.com/v1.0/chats/$THREAD_ID/messages" \
   -H "Authorization: Bearer HAVETOKEN-XYZ12345" \
   -H "Content-Type: application/json" \
   -d @sendmessage.json
+
+
+#Option2
+# base
+THREAD_ID=$(
+  curl -s -G "https://graph.microsoft.com/v1.0/me/onlineMeetings" \
+    --data-urlencode "\$filter=joinWebUrl eq '${JOIN_URL}'" \
+    -H "Authorization: Bearer $GRAPH_TOKEN" \
+    -H "Accept: application/json" \
+  | jq -r '.value[0].chatInfo.threadId'
+)
+
+echo "threadId: $THREAD_ID"
+
+# bash message send all in one
+MSG="Hello from Codespaces 👋"
+curl -s -X POST "https://graph.microsoft.com/v1.0/chats/$THREAD_ID/messages" \
+  -H "Authorization: Bearer $GRAPH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg msg "$MSG" '{body:{contentType:"html", content:$msg}}')"

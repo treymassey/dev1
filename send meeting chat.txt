@@ -1,0 +1,27 @@
+#bash 
+cat > sendmessage.json <<'EOF'
+{
+  "body": {
+    "contentType": "html",
+    "content": "Hello from Codespaces 👋"
+  }
+}
+EOF
+
+# bash
+JOIN_URL='https://teams.microsoft.com/l/meetup-join/19%3ameeting_OWI4YmNlMTUtYjc4Ni00MGI3LWIzYTQtMzI3NGY5MzUwOGZj%40thread.v2/0?context=...'
+
+ENCODED_JOIN_URL=$(python3 -c "import urllib.parse,os;print(urllib.parse.quote(os.environ['JOIN_URL'], safe=''))" )
+
+THREAD_ID=$(curl -s -X GET "https://graph.microsoft.com/v1.0/me/onlineMeetings?\$filter=joinWebUrl%20eq%20'${ENCODED_JOIN_URL}'" \
+  -H "Authorization: Bearer HAVETOKEN-XYZ12345" \
+  -H "Accept: application/json" \
+  | jq -r '.value[0].chatInfo.threadId')
+
+echo "threadId: $THREAD_ID"
+
+# bash
+curl -X POST "https://graph.microsoft.com/v1.0/chats/$THREAD_ID/messages" \
+  -H "Authorization: Bearer HAVETOKEN-XYZ12345" \
+  -H "Content-Type: application/json" \
+  -d @sendmessage.json
